@@ -1,0 +1,47 @@
+# ----------------------------------------------------------------------
+# 1. Các Thư mục và File của PyCharm (IDE)
+# ----------------------------------------------------------------------
+# Bỏ qua thư mục .idea/ chứa cấu hình dự án cá nhân của PyCharm
+.idea/
+# Bỏ qua các file cài đặt Workspace cục bộ
+*.iws
+
+# ----------------------------------------------------------------------
+# 2. Môi trường Ảo (Virtual Environment)
+# ----------------------------------------------------------------------
+# Môi trường ảo chứa tất cả các thư viện (packages) bạn cài đặt.
+# Nó có thể được tạo lại bằng pip/conda, vì vậy không cần commit.
+venv/
+env/
+*.venv
+
+# ----------------------------------------------------------------------
+# 3. Cache và Bytecode của Python
+# ----------------------------------------------------------------------
+# File cache bytecode (giúp Python chạy nhanh hơn, nhưng không cần commit)
+__pycache__/
+*.pyc
+
+# Cache của công cụ kiểm tra độ bao phủ (coverage)
+.coverage
+
+# ----------------------------------------------------------------------
+# 4. File Build/Phân phối
+# ----------------------------------------------------------------------
+# Thư mục/file phân phối
+/dist
+/build
+*.egg-info/
+.eggs/
+
+# ----------------------------------------------------------------------
+# 5. Notebooks và Data (Tuỳ chọn)
+# ----------------------------------------------------------------------
+# File tạm thời của Jupyter Notebook
+.ipynb_checkpoints
+
+# ----------------------------------------------------------------------
+# 6. File Cấu hình Riêng tư/Nhạy cảm (Rất Quan Trọng!)
+# ----------------------------------------------------------------------
+# Nếu bạn dùng file .env để lưu trữ khóa API, mật khẩu, v.v., hãy bỏ qua nó!
+.env

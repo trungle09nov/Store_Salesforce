@@ -1,0 +1,4 @@
+asyncpg
+psycopg
+python-dotenv
+simple-salesforce
