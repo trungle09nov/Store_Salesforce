@@ -3,6 +3,7 @@
 # ----------------------------------------------------------------------
 # Bỏ qua thư mục .idea/ chứa cấu hình dự án cá nhân của PyCharm
 .idea/
+.idea/*
 # Bỏ qua các file cài đặt Workspace cục bộ
 *.iws
 
