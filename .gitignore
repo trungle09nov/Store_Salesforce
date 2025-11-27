@@ -46,3 +46,9 @@ __pycache__/
 # ----------------------------------------------------------------------
 # Nếu bạn dùng file .env để lưu trữ khóa API, mật khẩu, v.v., hãy bỏ qua nó!
 .env
+
+log
+log/*
+
+data
+data/*
