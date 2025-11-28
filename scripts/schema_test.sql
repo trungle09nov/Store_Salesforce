@@ -1,6 +1,6 @@
 -- =====================================================
 -- DATABASE SCHEMA FOR SALESFORCE INTEGRATION
--- Tables: Account, Objekt, Unit
+-- Tables: Account, Objekt, Unit, Owner_Relationship
 -- =====================================================
 
 -- =====================================================
@@ -344,7 +344,49 @@ CREATE INDEX idx_units_oldeigentumer ON units(oldeigentumer__c);
 CREATE INDEX idx_units_type ON units(type_of_unit__c);
 
 -- =====================================================
--- FOREIGN KEY CONSTRAINTS (Optional - add if needed)
+-- 4. OWNER_RELATIONSHIP TABLE
+-- =====================================================
+CREATE TABLE IF NOT EXISTS owner_relationships (
+    id VARCHAR(18) PRIMARY KEY,
+    name VARCHAR(80) NOT NULL,
+
+    -- 3 Lookups chính
+    owner__c VARCHAR(18),         -- ✅ Lookup to Account
+    unit__c VARCHAR(18),          -- ✅ Lookup to Unit
+    parent_objekt__c VARCHAR(18), -- ✅ Lookup to Objekt
+
+    owner_id VARCHAR(18) NOT NULL,
+    start_date__c DATE,
+    end_date__c DATE,
+
+    active__c BOOLEAN,
+    haus_unit_description__c VARCHAR(255),
+    objekt_name__c VARCHAR(255),
+
+    created_by_id VARCHAR(18) NOT NULL,
+    created_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_modified_by_id VARCHAR(18) NOT NULL,
+    last_modified_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    -- Foreign Keys cho cả 3 lookups
+    CONSTRAINT fk_owner_relationship_owner
+        FOREIGN KEY (owner__c) REFERENCES accounts(id),
+    CONSTRAINT fk_owner_relationship_unit
+        FOREIGN KEY (unit__c) REFERENCES units(id) ON DELETE CASCADE,
+    CONSTRAINT fk_owner_relationship_objekt
+        FOREIGN KEY (parent_objekt__c) REFERENCES objekts(id) ON DELETE CASCADE
+);
+
+-- Owner Relationship Indexes
+CREATE INDEX idx_owner_relationships_name ON owner_relationships(name);
+CREATE INDEX idx_owner_relationships_owner_id ON owner_relationships(owner_id);
+CREATE INDEX idx_owner_relationships_owner ON owner_relationships(owner__c);
+CREATE INDEX idx_owner_relationships_unit ON owner_relationships(unit__c);
+CREATE INDEX idx_owner_relationships_objekt ON owner_relationships(parent_objekt__c);
+CREATE INDEX idx_owner_relationships_dates ON owner_relationships(start_date__c, end_date__c);
+
+-- =====================================================
+-- FOREIGN KEY CONSTRAINTS
 -- =====================================================
 
 -- Account relationships
@@ -384,8 +426,9 @@ ALTER TABLE objekts ADD CONSTRAINT fk_objekt_management_company
 COMMENT ON TABLE accounts IS 'Salesforce Account object - Business and Person accounts';
 COMMENT ON TABLE objekts IS 'Property/Building object - manages real estate properties';
 COMMENT ON TABLE units IS 'Unit object - individual apartments, commercial spaces, or parking spots within an Objekt';
+COMMENT ON TABLE owner_relationships IS 'Junction table linking Accounts (owners) to Units with date ranges';
 
--- Fixed: objekt__c is in units table, not objekts table
 COMMENT ON COLUMN units.objekt__c IS 'Master-Detail relationship - Unit cannot exist without Objekt';
 COMMENT ON COLUMN objekts.apartment_unit__c IS 'Roll-up summary: COUNT of Units where type is apartment';
 COMMENT ON COLUMN objekts.total_vertrage__c IS 'Roll-up summary: COUNT of all Customer contracts';
+COMMENT ON COLUMN owner_relationships.active__c IS 'Formula: TRUE if current date is between start_date__c and end_date__c';

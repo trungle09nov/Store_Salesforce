@@ -1,17 +1,16 @@
 """
-Salesforce Incremental Sync Script - CORRECTED VERSION
-Uses actual Salesforce object names from your org
+Salesforce to PostgreSQL Sync
+Just fetch data from SF API and update to PostgreSQL
 """
 
-import asyncio
-import asyncpg
-from simple_salesforce import Salesforce
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
-import logging
 import os
-from dataclasses import dataclass
+import requests
+import psycopg2
+from psycopg2.extras import execute_batch
+import logging
+from datetime import datetime, timedelta
 
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -19,721 +18,429 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SyncConfig:
-    """Configuration for Salesforce sync"""
-    # Salesforce credentials
-    sf_username: str
-    sf_password: str
-    sf_security_token: str
-    sf_domain: str = 'login'
+class SalesforceAPI:
+    """Salesforce API client"""
 
-    # PostgreSQL credentials
-    db_host: str = 'localhost'
-    db_port: int = 5432
-    db_name: str = 'property_management'
-    db_user: str = 'postgres'
-    db_password: str = 'your_password'
+    def __init__(self, instance_url: str, api_version: str, access_token: str):
+        self.instance_url = instance_url
+        self.api_version = api_version
+        self.access_token = access_token
+        self.headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
 
-    # Sync settings
-    sync_interval_minutes: int = 5
-    batch_size: int = 200
+    def query(self, soql: str) -> list:
+        """Execute SOQL query and return all records"""
+        # Clean query string: remove newlines and extra spaces
+        clean_soql = " ".join(soql.split())
+
+        url = f"{self.instance_url}/services/data/{self.api_version}/query/"
+        params = {'q': clean_soql}
+
+        all_records = []
+
+        try:
+            # Initial request
+            response = requests.get(url, headers=self.headers, params=params)
+
+            # Error handling for bad queries
+            if response.status_code == 400:
+                logger.error(f"Bad Request (400). Query sent: {clean_soql}")
+                logger.error(f"Response: {response.text}")
+
+            response.raise_for_status()
+            data = response.json()
+
+            # Get records
+            records = data.get('records', [])
+            all_records.extend(records)
+
+            # Handle pagination
+            while not data.get('done', True):
+                next_url = data.get('nextRecordsUrl')
+                if not next_url:
+                    break
+
+                logger.info(f"Fetching next batch... (total: {len(all_records)})")
+                response = requests.get(f"{self.instance_url}{next_url}", headers=self.headers)
+                response.raise_for_status()
+                data = response.json()
+                all_records.extend(data.get('records', []))
+
+            logger.info(f"Fetched {len(all_records)} records")
+            return all_records
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Query failed: {e}")
+            raise
 
 
-class SalesforceIncrementalSync:
-    """Handles incremental sync from Salesforce to PostgreSQL"""
+class PostgresDB:
+    """PostgreSQL client"""
 
-    # Mapping Salesforce objects to PostgreSQL tables
-    OBJECT_MAPPING = {
-        'Account': 'clients',
-        'Objekt__c': 'properties',
-        'Hausunit__c': 'units',
-        'Beziehung_zur_Einheit__c': 'unit_owners'
+    def __init__(self, host: str, port: int, database: str, user: str, password: str):
+        self.conn_params = {
+            'host': host,
+            'port': port,
+            'database': database,
+            'user': user,
+            'password': password
+        }
+        self.conn = None
+
+    def connect(self):
+        """Connect to database"""
+        self.conn = psycopg2.connect(**self.conn_params)
+        self.conn.autocommit = False
+        logger.info(f"Connected to PostgreSQL: {self.conn_params['database']}")
+
+    def close(self):
+        """Close connection"""
+        if self.conn:
+            self.conn.close()
+            logger.info("Database connection closed")
+
+    def upsert_records(self, table: str, records: list, upsert_sql: str):
+        """Insert or update records"""
+        if not records:
+            logger.warning(f"No records to sync for {table}")
+            return
+
+        logger.info(f"Upserting {len(records)} records to {table}...")
+
+        # Clean records (remove Salesforce metadata)
+        clean_records = []
+        for record in records:
+            # Remove 'attributes' which contains URL and Type info
+            clean = {k: v for k, v in record.items() if not k.startswith('attributes')}
+            clean_records.append(clean)
+
+        try:
+            cursor = self.conn.cursor()
+            execute_batch(cursor, upsert_sql, clean_records, page_size=100)
+            self.conn.commit()
+            logger.info(f"✓ Successfully synced {len(records)} records to {table}")
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"✗ Failed to sync {table}: {e}")
+            # Print first record to help debug keys
+            if clean_records:
+                logger.error(f"Sample record keys: {clean_records[0].keys()}")
+            raise
+
+
+class SalesforceSync:
+    """Main sync orchestrator"""
+
+    # SOQL Queries - STRICTLY MATCHING USER DUMP
+    QUERIES = {
+        'account': """
+            SELECT 
+                Id, Name, Salutation, FirstName, LastName, MiddleName, Suffix,
+                OwnerId, RecordTypeId, ParentId,
+                Account_Balance__c,
+                PersonEmail, PersonMobilePhone, PersonHomePhone, 
+                PersonAssistantPhone,
+                Phone, Email__c, Email_2__pc, Email_2__c, Mobile_phone__c,
+                Other_mobile_phone__pc, Other_phone__c, Fax, Website,
+                BillingStreet, BillingCity, BillingState, BillingPostalCode, BillingCountry,
+                BillingLatitude, BillingLongitude,
+                ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry,
+                ShippingLatitude, ShippingLongitude,
+                PersonMailingStreet, PersonMailingCity, PersonMailingState,
+                PersonMailingPostalCode, PersonMailingCountry, PersonMailingLatitude, PersonMailingLongitude,
+                PersonOtherPhone,
+                AccountSource, Industry,
+                Contact_import_sourc__pc, Account_type__c, Contacttype__pc,
+                PersonBirthdate, PersonTitle, PersonDepartment,
+                IsCustomerPortal, NumberOfEmployees, SicDesc,
+                Bankverbindung_IBAN__c, Freistellungs_bescheinigung__c,
+                Inside_ID__pc, Community_user_ID__pc, Default_community_userID__c,
+                Community_user_calculation__c, Created_by_auto_flow__c,
+                PersonIndividualId, PersonReportsToId,
+                FlowToolKit__Latest_Form_Submission__c, FlowToolKit__Latest_Form_Submission__pc,
+                Novumstate_campaign__pc,
+                Description, Jigsaw, SourceSystemIdentifier,
+                CreatedById, CreatedDate, LastModifiedById, LastModifiedDate,
+                PersonLastCURequestDate, PersonLastCUUpdateDate
+            FROM Account
+            WHERE IsDeleted = false
+        """,
+
+        'objekt': """
+            SELECT 
+                Id, Name, Objekt_ID__c,
+                Address__Street__s, Address__City__s, Address__StateCode__s, 
+                Address__PostalCode__s, Address__CountryCode__s, 
+                Address__Latitude__s, Address__Longitude__s,
+                Anzahl_WE__c, Anzahl_Gew__c, Anzahl_Stellplaz__c, Number_of_other_unit_types__c,
+                Apartment_unit__c, Gewerbeeinheiten__c, Stellplatze__c,
+                In_management_this_year__c, In_management_next_year__c,
+                Vertragsende_letzter_SEV_Vertrag__c, Verwaltervertragsende__c,
+                Difference_WE__c, Difference_GEw__c, Different_stellplatz__c,
+                Total_houses_and_offices__c, Wohn_Gewerbeeinheiten__c,
+                Check_today_with_last_SEV_date__c, Check_today_with_last_vertrage_date__c,
+                City_group__c, Management_level__c, Property_manager__c, Verwaltungsstatus__c,
+                ID_Name__c, view_link__c,
+                Eigentumer__c, Hausmeister__c, Hausreinigung__c, Elektro__c, 
+                Heizung_Sanitar__c, Messdienstleister__c, Schlusseldienst__c, 
+                Versicherungsmakler__c, Wasserschadenbehebung__c, Winterdienst__c, 
+                Management_companyold__c,
+                Hausverwaltung__c, Objektbuchhalter__c, OwnerId,
+                Contract_origin_objekt__c, Name_system__c, Priority__c, Type_WEG_MV__c,
+                Objekt_emailaddress__c, Owners_emails__c, Tenants_emails__c,
+                Picture__c, Letzte_Abrechnung__c, Allgemeine_Hinweise__c, 
+                Status_Objektbuchhaltung__c, Checked_and_confirmed__c,
+                Impower__c,
+                CreatedById, CreatedDate, LastModifiedById, LastModifiedDate
+            FROM Objekt__c
+            WHERE IsDeleted = false
+        """,
+
+        'unit': """
+            SELECT 
+                Id, Name, Description__c, Objekt__c,
+                Type_of_unit__c, Bauart__c, Wohnflache__c, Heizflache__c,
+                AccountingID__c, Impower_Unit_ID__c,
+                Count_active_SEV_contracts__c, Count_vertrage__c,
+                Last_vertrag_start_date__c, Last_vertrage_end_date__c,
+                Objekt_text__c, Owner_note__c, Trigger__c,
+                CreatedById, CreatedDate, LastModifiedById, LastModifiedDate
+            FROM Hausunit__c
+            WHERE IsDeleted = false
+        """
     }
 
-    def __init__(self, config: SyncConfig):
-        self.config = config
-        self.sf: Optional[Salesforce] = None
-        self.pool: Optional[asyncpg.Pool] = None
-
-    def connect_salesforce(self):
-        """Connect to Salesforce"""
-        try:
-            self.sf = Salesforce(
-                username=self.config.sf_username,
-                password=self.config.sf_password,
-                security_token=self.config.sf_security_token,
-                domain=self.config.sf_domain
+    # Upsert SQL - Matched strictly to the simplified queries above
+    UPSERT_SQL = {
+        'account': """
+            INSERT INTO accounts (
+                id, name, salutation, first_name, last_name, middle_name, suffix,
+                owner_id, record_type_id, parent_id,
+                account_balance,
+                person_email, person_mobile_phone, person_home_phone,
+                person_assistant_phone,
+                phone, email__c, email_2__pc, email_2__c, mobile_phone__c,
+                other_mobile_phone__pc, other_phone__c, fax, website,
+                billing_street, billing_city, billing_state, billing_postal_code, billing_country,
+                billing_latitude, billing_longitude,
+                shipping_street, shipping_city, shipping_state, shipping_postal_code, shipping_country,
+                shipping_latitude, shipping_longitude,
+                person_mailing_street, person_mailing_city, person_mailing_state,
+                person_mailing_postal_code, person_mailing_country,
+                person_mailing_latitude, person_mailing_longitude,
+                person_other_phone,
+                account_source, industry,
+                contact_import_sourc__pc,
+                account_type__c, contacttype__pc,
+                person_birthdate, person_title, person_department,
+                is_customer_portal, number_of_employees, sic_desc,
+                bankverbindung_iban__c, freistellungs_bescheinigung__c,
+                inside_id__pc, community_user_id__pc, default_community_userid__c,
+                community_user_calculation__c, created_by_auto_flow__c,
+                person_individual_id, person_reports_to_id,
+                flowtoolkit__latest_form_submission__c, flowtoolkit__latest_form_submission__pc,
+                novumstate_campaign__pc,
+                description, jigsaw, source_system_identifier,
+                created_by_id, created_date, last_modified_by_id, last_modified_date,
+                person_last_cu_request_date, person_last_cu_update_date
+            ) VALUES (
+                %(Id)s, %(Name)s, %(Salutation)s, %(FirstName)s, %(LastName)s, %(MiddleName)s, %(Suffix)s,
+                %(OwnerId)s, %(RecordTypeId)s, %(ParentId)s,
+                %(Account_Balance__c)s,
+                %(PersonEmail)s, %(PersonMobilePhone)s, %(PersonHomePhone)s,
+                %(PersonAssistantPhone)s,
+                %(Phone)s, %(Email__c)s, %(Email_2__pc)s, %(Email_2__c)s, %(Mobile_phone__c)s,
+                %(Other_mobile_phone__pc)s, %(Other_phone__c)s, %(Fax)s, %(Website)s,
+                %(BillingStreet)s, %(BillingCity)s, %(BillingState)s, %(BillingPostalCode)s, %(BillingCountry)s,
+                %(BillingLatitude)s, %(BillingLongitude)s,
+                %(ShippingStreet)s, %(ShippingCity)s, %(ShippingState)s, %(ShippingPostalCode)s, %(ShippingCountry)s,
+                %(ShippingLatitude)s, %(ShippingLongitude)s,
+                %(PersonMailingStreet)s, %(PersonMailingCity)s, %(PersonMailingState)s,
+                %(PersonMailingPostalCode)s, %(PersonMailingCountry)s,
+                %(PersonMailingLatitude)s, %(PersonMailingLongitude)s,
+                %(PersonOtherPhone)s,
+                %(AccountSource)s, %(Industry)s,
+                %(Contact_import_sourc__pc)s,
+                %(Account_type__c)s, %(Contacttype__pc)s,
+                %(PersonBirthdate)s, %(PersonTitle)s, %(PersonDepartment)s,
+                %(IsCustomerPortal)s, %(NumberOfEmployees)s, %(SicDesc)s,
+                %(Bankverbindung_IBAN__c)s, %(Freistellungs_bescheinigung__c)s,
+                %(Inside_ID__pc)s, %(Community_user_ID__pc)s, %(Default_community_userID__c)s,
+                %(Community_user_calculation__c)s, %(Created_by_auto_flow__c)s,
+                %(PersonIndividualId)s, %(PersonReportsToId)s,
+                %(FlowToolKit__Latest_Form_Submission__c)s, %(FlowToolKit__Latest_Form_Submission__pc)s,
+                %(Novumstate_campaign__pc)s,
+                %(Description)s, %(Jigsaw)s, %(SourceSystemIdentifier)s,
+                %(CreatedById)s, %(CreatedDate)s, %(LastModifiedById)s, %(LastModifiedDate)s,
+                %(PersonLastCURequestDate)s, %(PersonLastCUUpdateDate)s
             )
-            logger.info("✓ Connected to Salesforce")
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                last_modified_by_id = EXCLUDED.last_modified_by_id,
+                last_modified_date = EXCLUDED.last_modified_date
+        """,
+
+        'objekt': """
+            INSERT INTO objekts (
+                id, name, objekt_id__c,
+                address_street, address_city, address_state, address_postal_code, address_country,
+                address_latitude, address_longitude,
+                anzahl_we__c, anzahl_gew__c, anzahl_stellplaz__c, number_of_other_unit_types__c,
+                apartment_unit__c, gewerbeeinheiten__c, stellplatze__c,
+                in_management_this_year__c, in_management_next_year__c,
+                vertragsende_letzter_sev_vertrag__c, verwaltervertragsende__c,
+                difference_we__c, difference_gew__c, different_stellplatz__c,
+                total_houses_and_offices__c, wohn_gewerbeeinheiten__c,
+                check_today_with_last_sev_date__c, check_today_with_last_vertrage_date__c,
+                city_group__c, management_level__c, property_manager__c, verwaltungsstatus__c,
+                id_name__c, view_link__c,
+                eigentumer__c, hausmeister__c, hausreinigung__c, elektro__c,
+                heizung_sanitar__c, messdienstleister__c, schlusseldienst__c,
+                versicherungsmakler__c, wasserschadenbehebung__c, winterdienst__c,
+                management_companyold__c,
+                hausverwaltung__c, objektbuchhalter__c, owner_id,
+                contract_origin_objekt__c, name_system__c, priority__c, type_weg_mv__c,
+                objekt_emailaddress__c, owners_emails__c, tenants_emails__c,
+                picture__c, letzte_abrechnung__c, allgemeine_hinweise__c,
+                status_objektbuchhaltung__c, checked_and_confirmed__c,
+                impower__c,
+                created_by_id, created_date, last_modified_by_id, last_modified_date
+            ) VALUES (
+                %(Id)s, %(Name)s, %(Objekt_ID__c)s,
+                %(Address__Street__s)s, %(Address__City__s)s, %(Address__StateCode__s)s,
+                %(Address__PostalCode__s)s, %(Address__CountryCode__s)s,
+                %(Address__Latitude__s)s, %(Address__Longitude__s)s,
+                %(Anzahl_WE__c)s, %(Anzahl_Gew__c)s, %(Anzahl_Stellplaz__c)s, %(Number_of_other_unit_types__c)s,
+                %(Apartment_unit__c)s, %(Gewerbeeinheiten__c)s, %(Stellplatze__c)s,
+                %(In_management_this_year__c)s, %(In_management_next_year__c)s,
+                %(Vertragsende_letzter_SEV_Vertrag__c)s, %(Verwaltervertragsende__c)s,
+                %(Difference_WE__c)s, %(Difference_GEw__c)s, %(Different_stellplatz__c)s,
+                %(Total_houses_and_offices__c)s, %(Wohn_Gewerbeeinheiten__c)s,
+                %(Check_today_with_last_SEV_date__c)s, %(Check_today_with_last_vertrage_date__c)s,
+                %(City_group__c)s, %(Management_level__c)s, %(Property_manager__c)s, %(Verwaltungsstatus__c)s,
+                %(ID_Name__c)s, %(view_link__c)s,
+                %(Eigentumer__c)s, %(Hausmeister__c)s, %(Hausreinigung__c)s, %(Elektro__c)s,
+                %(Heizung_Sanitar__c)s, %(Messdienstleister__c)s, %(Schlusseldienst__c)s,
+                %(Versicherungsmakler__c)s, %(Wasserschadenbehebung__c)s, %(Winterdienst__c)s,
+                %(Management_companyold__c)s,
+                %(Hausverwaltung__c)s, %(Objektbuchhalter__c)s, %(OwnerId)s,
+                %(Contract_origin_objekt__c)s, %(Name_system__c)s, %(Priority__c)s, %(Type_WEG_MV__c)s,
+                %(Objekt_emailaddress__c)s, %(Owners_emails__c)s, %(Tenants_emails__c)s,
+                %(Picture__c)s, %(Letzte_Abrechnung__c)s, %(Allgemeine_Hinweise__c)s,
+                %(Status_Objektbuchhaltung__c)s, %(Checked_and_confirmed__c)s,
+                %(Impower__c)s,
+                %(CreatedById)s, %(CreatedDate)s, %(LastModifiedById)s, %(LastModifiedDate)s
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                last_modified_by_id = EXCLUDED.last_modified_by_id,
+                last_modified_date = EXCLUDED.last_modified_date
+        """,
+
+        'unit': """
+            INSERT INTO units (
+                id, name, description__c, objekt__c,
+                type_of_unit__c, bauart__c, wohnflache__c, heizflache__c,
+                accounting_id__c, impower_unit_id__c,
+                count_active_sev_contracts__c, count_vertrage__c,
+                last_vertrag_start_date__c, last_vertrage_end_date__c,
+                objekt_text__c, owner_note__c, trigger__c,
+                created_by_id, created_date, last_modified_by_id, last_modified_date
+            ) VALUES (
+                %(Id)s, %(Name)s, %(Description__c)s, %(Objekt__c)s,
+                %(Type_of_unit__c)s, %(Bauart__c)s, %(Wohnflache__c)s, %(Heizflache__c)s,
+                %(AccountingID__c)s, %(Impower_Unit_ID__c)s,
+                %(Count_active_SEV_contracts__c)s, %(Count_vertrage__c)s,
+                %(Last_vertrag_start_date__c)s, %(Last_vertrage_end_date__c)s,
+                %(Objekt_text__c)s, %(Owner_note__c)s, %(Trigger__c)s,
+                %(CreatedById)s, %(CreatedDate)s, %(LastModifiedById)s, %(LastModifiedDate)s
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                last_modified_by_id = EXCLUDED.last_modified_by_id,
+                last_modified_date = EXCLUDED.last_modified_date
+        """
+    }
+
+    def __init__(self):
+        """Initialize from environment variables"""
+        # Salesforce config
+        self.sf_api = SalesforceAPI(
+            instance_url=os.getenv('SF_INSTANCE_URL', 'https://novumstate.my.salesforce.com'),
+            api_version=os.getenv('SF_API_VERSION', 'v65.0'),
+            access_token=os.getenv('SF_ACCESS_TOKEN')
+        )
+
+        # PostgreSQL config
+        self.db = PostgresDB(
+            host=os.getenv('PG_HOST', 'localhost'),
+            port=int(os.getenv('PG_PORT', 5432)),
+            database=os.getenv('PG_DATABASE'),
+            user=os.getenv('PG_USER'),
+            password=os.getenv('PG_PASSWORD')
+        )
+
+    def sync_all(self):
+        """Sync all tables"""
+        try:
+            self.db.connect()
+            logger.info("=== Starting full sync ===")
+
+            # Sync in order (foreign key dependencies)
+            tables = [
+                ('account', 'accounts'),
+                ('objekt', 'objekts'),
+                ('unit', 'units')
+            ]
+
+            for query_key, table_name in tables:
+                logger.info(f"\n--- Syncing {table_name} ---")
+                records = self.sf_api.query(self.QUERIES[query_key])
+                self.db.upsert_records(table_name, records, self.UPSERT_SQL[query_key])
+
+            logger.info("\n=== ✓ Full sync completed ===")
+
         except Exception as e:
-            logger.error(f"✗ Failed to connect to Salesforce: {e}")
+            logger.error(f"Sync failed: {e}")
             raise
+        finally:
+            self.db.close()
 
-    async def init_pool(self):
-        """Initialize PostgreSQL connection pool"""
+    def sync_incremental(self, hours: int = 24):
+        """Sync only recent changes"""
         try:
-            self.pool = await asyncpg.create_pool(
-                host=self.config.db_host,
-                port=self.config.db_port,
-                database=self.config.db_name,
-                user=self.config.db_user,
-                password=self.config.db_password,
-                min_size=5,
-                max_size=20
-            )
-            logger.info("✓ Connected to PostgreSQL")
+            self.db.connect()
+            logger.info(f"=== Starting incremental sync (last {hours}h) ===")
+
+            # Calculate cutoff datetime
+            cutoff = datetime.utcnow() - timedelta(hours=hours)
+            cutoff_str = cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            # Sync in order
+            tables = [
+                ('account', 'accounts'),
+                ('objekt', 'objekts'),
+                ('unit', 'units')
+            ]
+
+            for query_key, table_name in tables:
+                logger.info(f"\n--- Syncing {table_name} (modified since {cutoff_str}) ---")
+
+                # Add time filter to query
+                query = self.QUERIES[query_key].replace(
+                    'WHERE IsDeleted = false',
+                    f'WHERE IsDeleted = false AND LastModifiedDate > {cutoff_str}'
+                )
+
+                records = self.sf_api.query(query)
+                self.db.upsert_records(table_name, records, self.UPSERT_SQL[query_key])
+
+            logger.info("\n=== ✓ Incremental sync completed ===")
+
         except Exception as e:
-            logger.error(f"✗ Failed to connect to PostgreSQL: {e}")
+            logger.error(f"Sync failed: {e}")
             raise
-
-    async def get_last_sync_time(self, object_name: str) -> datetime:
-        """Get the last successful sync time for an object"""
-        async with self.pool.acquire() as conn:
-            result = await conn.fetchval(
-                "SELECT last_sync_time FROM sync_metadata WHERE object_name = $1",
-                object_name
-            )
-            return result or (datetime.now() - timedelta(days=30))
-
-    async def update_sync_metadata(
-            self,
-            object_name: str,
-            sync_time: datetime,
-            record_count: int,
-            error: Optional[str] = None
-    ):
-        """Update sync metadata after sync"""
-        async with self.pool.acquire() as conn:
-            if error:
-                await conn.execute("""
-                                   UPDATE sync_metadata
-                                   SET total_errors = total_errors + 1,
-                                       last_error   = $2,
-                                       updated_at   = NOW()
-                                   WHERE object_name = $1
-                                   """, object_name, error)
-            else:
-                await conn.execute("""
-                                   INSERT INTO sync_metadata (object_name,
-                                                              last_sync_time,
-                                                              total_records,
-                                                              last_successful_sync)
-                                   VALUES ($1, $2, $3, $2) ON CONFLICT (object_name) 
-                    DO
-                                   UPDATE SET
-                                       last_sync_time = $2,
-                                       total_records = sync_metadata.total_records + $3,
-                                       last_successful_sync = $2,
-                                       updated_at = NOW()
-                                   """, object_name, sync_time, record_count)
-
-    def safe_value(self, val: Any, default=None) -> Any:
-        """Safely extract value, return None if null"""
-        return val if val not in (None, '', 'null') else default
-
-    async def sync_clients(self) -> int:
-        """Sync Account objects (clients)"""
-        object_name = 'Account'
-        logger.info(f"Syncing {object_name}...")
-
-        try:
-            last_sync = await self.get_last_sync_time(object_name)
-
-            # OPTIMIZED: Only fetch fields we actually use
-            query = f"""
-            SELECT Id, Name, FirstName, LastName, Salutation, MiddleName,
-                   PersonEmail, Phone, Mobile_phone__c, PersonMobilePhone, 
-                   PersonHomePhone, Other_phone__c, Fax, Website,
-                   Email_2__pc, IsPersonAccount, Account_type__c, AccountSource,
-                   Contacttype__pc,
-                   BillingStreet, BillingCity, BillingPostalCode, BillingState, 
-                   BillingCountry, BillingLatitude, BillingLongitude,
-                   PersonMailingStreet, PersonMailingCity, PersonMailingPostalCode, 
-                   PersonMailingState, PersonMailingCountry, PersonMailingLatitude, 
-                   PersonMailingLongitude,
-                   ShippingStreet, ShippingCity, ShippingPostalCode, ShippingState, 
-                   ShippingCountry,
-                   PersonBirthdate, PersonTitle, PersonDepartment,
-                   Industry, NumberOfEmployees, Description,
-                   Bankverbindung_IBAN__c, Account_Balance__c,
-                   IsCustomerPortal, Community_user_ID__pc, Default_community_userID__c,
-                   ParentId, MasterRecordId,
-                   OwnerId, RecordTypeId, CreatedById, CreatedDate,
-                   LastModifiedById, LastModifiedDate, LastActivityDate,
-                   SystemModstamp, IsDeleted, IsPriorityRecord, Created_by_auto_flow__c
-            FROM Account 
-            WHERE LastModifiedDate > {last_sync.isoformat()}
-            ORDER BY LastModifiedDate ASC
-            LIMIT 2000
-            """
-
-            results = self.sf.query_all(query)
-            records = results.get('records', [])
-
-            if not records:
-                logger.info(f"  No new changes for {object_name}")
-                return 0
-
-            logger.info(f"  Found {len(records)} modified records")
-
-            # Upsert to PostgreSQL
-            upsert_query = """
-                           INSERT INTO clients (sf_id, name, first_name, last_name, salutation, middle_name, \
-                                                person_email, phone, mobile_phone, person_mobile_phone, \
-                                                person_home_phone, other_phone, fax, website, email_2, \
-                                                is_person_account, account_type, account_source, contact_type, \
-                                                billing_street, billing_city, billing_postal_code, billing_state, \
-                                                billing_country, billing_latitude, billing_longitude, \
-                                                person_mailing_street, person_mailing_city, person_mailing_postal_code, \
-                                                person_mailing_state, person_mailing_country, person_mailing_latitude, \
-                                                person_mailing_longitude, \
-                                                shipping_street, shipping_city, shipping_postal_code, shipping_state, \
-                                                shipping_country, \
-                                                person_birthdate, person_title, person_department, \
-                                                industry, number_of_employees, description, \
-                                                bank_iban, account_balance, \
-                                                is_customer_portal, community_user_id, default_community_user_id, \
-                                                parent_id, master_record_id, \
-                                                owner_id, record_type_id, created_by_id, created_date, \
-                                                last_modified_by_id, last_modified_date, last_activity_date, \
-                                                system_modstamp, is_deleted, is_priority_record, created_by_auto_flow) \
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                                   $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, \
-                                   $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, \
-                                   $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, \
-                                   $55, $56, $57, $58, $59) ON CONFLICT (sf_id) DO \
-                           UPDATE SET
-                               name = EXCLUDED.name, \
-                               first_name = EXCLUDED.first_name, \
-                               last_name = EXCLUDED.last_name, \
-                               person_email = EXCLUDED.person_email, \
-                               phone = EXCLUDED.phone, \
-                               billing_city = EXCLUDED.billing_city, \
-                               billing_street = EXCLUDED.billing_street, \
-                               is_person_account = EXCLUDED.is_person_account, \
-                               last_modified_date = EXCLUDED.last_modified_date, \
-                               is_deleted = EXCLUDED.is_deleted, \
-                               synced_at = NOW() \
-                           """
-
-            data = []
-            for r in records:
-                data.append((
-                    r['Id'],
-                    self.safe_value(r.get('Name')),
-                    self.safe_value(r.get('FirstName')),
-                    self.safe_value(r.get('LastName')),
-                    self.safe_value(r.get('Salutation')),
-                    self.safe_value(r.get('MiddleName')),
-                    self.safe_value(r.get('PersonEmail')),
-                    self.safe_value(r.get('Phone')),
-                    self.safe_value(r.get('Mobile_phone__c')),
-                    self.safe_value(r.get('PersonMobilePhone')),
-                    self.safe_value(r.get('PersonHomePhone')),
-                    self.safe_value(r.get('Other_phone__c')),
-                    self.safe_value(r.get('Fax')),
-                    self.safe_value(r.get('Website')),
-                    self.safe_value(r.get('Email_2__pc')),
-                    r.get('IsPersonAccount', False),
-                    self.safe_value(r.get('Account_type__c')),
-                    self.safe_value(r.get('AccountSource')),
-                    self.safe_value(r.get('Contacttype__pc')),
-                    self.safe_value(r.get('BillingStreet')),
-                    self.safe_value(r.get('BillingCity')),
-                    self.safe_value(r.get('BillingPostalCode')),
-                    self.safe_value(r.get('BillingState')),
-                    self.safe_value(r.get('BillingCountry')),
-                    self.safe_value(r.get('BillingLatitude')),
-                    self.safe_value(r.get('BillingLongitude')),
-                    self.safe_value(r.get('PersonMailingStreet')),
-                    self.safe_value(r.get('PersonMailingCity')),
-                    self.safe_value(r.get('PersonMailingPostalCode')),
-                    self.safe_value(r.get('PersonMailingState')),
-                    self.safe_value(r.get('PersonMailingCountry')),
-                    self.safe_value(r.get('PersonMailingLatitude')),
-                    self.safe_value(r.get('PersonMailingLongitude')),
-                    self.safe_value(r.get('ShippingStreet')),
-                    self.safe_value(r.get('ShippingCity')),
-                    self.safe_value(r.get('ShippingPostalCode')),
-                    self.safe_value(r.get('ShippingState')),
-                    self.safe_value(r.get('ShippingCountry')),
-                    self.safe_value(r.get('PersonBirthdate')),
-                    self.safe_value(r.get('PersonTitle')),
-                    self.safe_value(r.get('PersonDepartment')),
-                    self.safe_value(r.get('Industry')),
-                    self.safe_value(r.get('NumberOfEmployees')),
-                    self.safe_value(r.get('Description')),
-                    self.safe_value(r.get('Bankverbindung_IBAN__c')),
-                    self.safe_value(r.get('Account_Balance__c')),
-                    r.get('IsCustomerPortal', False),
-                    self.safe_value(r.get('Community_user_ID__pc')),
-                    self.safe_value(r.get('Default_community_userID__c')),
-                    self.safe_value(r.get('ParentId')),
-                    self.safe_value(r.get('MasterRecordId')),
-                    self.safe_value(r.get('OwnerId')),
-                    self.safe_value(r.get('RecordTypeId')),
-                    self.safe_value(r.get('CreatedById')),
-                    self.safe_value(r.get('CreatedDate')),
-                    self.safe_value(r.get('LastModifiedById')),
-                    self.safe_value(r.get('LastModifiedDate')),
-                    self.safe_value(r.get('LastActivityDate')),
-                    self.safe_value(r.get('SystemModstamp')),
-                    r.get('IsDeleted', False),
-                    r.get('IsPriorityRecord', False),
-                    r.get('Created_by_auto_flow__c', False)
-                ))
-
-            async with self.pool.acquire() as conn:
-                await conn.executemany(upsert_query, data)
-
-            await self.update_sync_metadata(object_name, datetime.now(), len(records))
-            logger.info(f"  ✓ Synced {len(records)} {object_name} records")
-            return len(records)
-
-        except Exception as e:
-            error_msg = f"Error syncing {object_name}: {str(e)}"
-            logger.error(f"  ✗ {error_msg}")
-            await self.update_sync_metadata(object_name, datetime.now(), 0, error_msg)
-            return 0
-
-    async def sync_properties(self) -> int:
-        """Sync Objekt__c objects"""
-        object_name = 'Objekt__c'
-        logger.info(f"Syncing {object_name}...")
-
-        try:
-            last_sync = await self.get_last_sync_time(object_name)
-
-            # OPTIMIZED: Only essential fields
-            query = f"""
-            SELECT Id, Name, Objekt_ID__c, Name_system__c, ID_Name__c,
-                   Address__Street__s, Address__City__s, Address__PostalCode__s,
-                   Address__StateCode__s, Address__CountryCode__s,
-                   Address__Latitude__s, Address__Longitude__s,
-                   Anzahl_WE__c, Anzahl_Gew__c, Anzahl_Stellplaz__c,
-                   Gewerbeeinheiten__c, Wohn_Gewerbeeinheiten__c,
-                   Total_houses_and_offices__c, Stellplatze__c, Apartment_unit__c,
-                   Difference_WE__c, Difference_GEw__c, Different_stellplatz__c,
-                   Type_WEG_MV__c, Verwaltungsstatus__c, Management_level__c,
-                   City_group__c, Priority__c,
-                   Hausverwaltung__c, Property_manager__c, Management_companyold__c,
-                   Objektbuchhalter__c, Eigentumer__c, Hausmeister__c,
-                   Hausreinigung__c, Heizung_Sanitar__c, Elektro__c,
-                   Messdienstleister__c, Versicherungsmakler__c,
-                   Wasserschadenbehebung__c, Winterdienst__c, Schlusseldienst__c,
-                   Objekt_emailaddress__c, Owners_emails__c, Tenants_emails__c,
-                   In_management_this_year__c, In_management_next_year__c,
-                   Letzte_Abrechnung__c, Vertragsende_letzter_SEV_Vertrag__c,
-                   Verwaltervertragsende__c, Allgemeine_Hinweise__c,
-                   Status_Objektbuchhaltung__c, Checked_and_confirmed__c,
-                   Check_today_with_last_SEV_date__c, Check_today_with_last_vertrage_date__c,
-                   Picture__c, view_link__c, Impower__c,
-                   OwnerId, CreatedById, CreatedDate, LastModifiedById,
-                   LastModifiedDate, LastActivityDate, SystemModstamp, IsDeleted
-            FROM Objekt__c 
-            WHERE LastModifiedDate > {last_sync.isoformat()}
-            ORDER BY LastModifiedDate ASC
-            LIMIT 2000
-            """
-
-            results = self.sf.query_all(query)
-            records = results.get('records', [])
-
-            if not records:
-                logger.info(f"  No new changes for {object_name}")
-                return 0
-
-            logger.info(f"  Found {len(records)} modified records")
-
-            upsert_query = """
-                           INSERT INTO properties (sf_id, name, objekt_id, name_system, id_name, \
-                                                   address_street, address_city, address_postal_code, address_state, \
-                                                   address_country, address_latitude, address_longitude, \
-                                                   anzahl_we, anzahl_gew, anzahl_stellplatz, gewerbeeinheiten, \
-                                                   wohn_gewerbeeinheiten, total_houses_and_offices, stellplatze, \
-                                                   apartment_unit, difference_we, difference_gew, different_stellplatz, \
-                                                   type_weg_mo, verwaltungsstatus, management_level, city_group, \
-                                                   priority, \
-                                                   hausverwaltung, property_manager, management_company_old, \
-                                                   objektbuchhalter, \
-                                                   eigentumer, hausmeister, hausreinigung, heizung_sanitar, elektro, \
-                                                   messdienstleister, versicherungsmakler, wasserschadenbehebung, \
-                                                   winterdienst, schlusseldienst, \
-                                                   objekt_emailaddress, owners_emails, tenants_emails, \
-                                                   in_management_this_year, in_management_next_year, \
-                                                   letzte_abrechnung, vertragsende_letzter_sev_vertrag, \
-                                                   verwaltervertragsende, \
-                                                   allgemeine_hinweise, status_objektbuchhaltung, \
-                                                   checked_and_confirmed, check_today_with_last_sev_date, \
-                                                   check_today_with_last_vertrage_date, \
-                                                   picture_url, view_link, impower_id, \
-                                                   owner_id, created_by_id, created_date, last_modified_by_id, \
-                                                   last_modified_date, last_activity_date, system_modstamp, is_deleted) \
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                                   $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, \
-                                   $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, \
-                                   $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, \
-                                   $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65) ON CONFLICT (sf_id) DO \
-                           UPDATE SET
-                               name = EXCLUDED.name, \
-                               anzahl_we = EXCLUDED.anzahl_we, \
-                               anzahl_gew = EXCLUDED.anzahl_gew, \
-                               address_city = EXCLUDED.address_city, \
-                               last_modified_date = EXCLUDED.last_modified_date, \
-                               is_deleted = EXCLUDED.is_deleted, \
-                               synced_at = NOW() \
-                           """
-
-            data = []
-            for r in records:
-                data.append((
-                    r['Id'],
-                    self.safe_value(r.get('Name')),
-                    self.safe_value(r.get('Objekt_ID__c')),
-                    self.safe_value(r.get('Name_system__c')),
-                    self.safe_value(r.get('ID_Name__c')),
-                    self.safe_value(r.get('Address__Street__s')),
-                    self.safe_value(r.get('Address__City__s')),
-                    self.safe_value(r.get('Address__PostalCode__s')),
-                    self.safe_value(r.get('Address__StateCode__s')),
-                    self.safe_value(r.get('Address__CountryCode__s')),
-                    self.safe_value(r.get('Address__Latitude__s')),
-                    self.safe_value(r.get('Address__Longitude__s')),
-                    self.safe_value(r.get('Anzahl_WE__c')),
-                    self.safe_value(r.get('Anzahl_Gew__c')),
-                    self.safe_value(r.get('Anzahl_Stellplaz__c')),
-                    self.safe_value(r.get('Gewerbeeinheiten__c')),
-                    self.safe_value(r.get('Wohn_Gewerbeeinheiten__c')),
-                    self.safe_value(r.get('Total_houses_and_offices__c')),
-                    self.safe_value(r.get('Stellplatze__c')),
-                    self.safe_value(r.get('Apartment_unit__c')),
-                    self.safe_value(r.get('Difference_WE__c')),
-                    self.safe_value(r.get('Difference_GEw__c')),
-                    self.safe_value(r.get('Different_stellplatz__c')),
-                    self.safe_value(r.get('Type_WEG_MV__c')),
-                    self.safe_value(r.get('Verwaltungsstatus__c')),
-                    self.safe_value(r.get('Management_level__c')),
-                    self.safe_value(r.get('City_group__c')),
-                    self.safe_value(r.get('Priority__c')),
-                    self.safe_value(r.get('Hausverwaltung__c')),
-                    self.safe_value(r.get('Property_manager__c')),
-                    self.safe_value(r.get('Management_companyold__c')),
-                    self.safe_value(r.get('Objektbuchhalter__c')),
-                    self.safe_value(r.get('Eigentumer__c')),
-                    self.safe_value(r.get('Hausmeister__c')),
-                    self.safe_value(r.get('Hausreinigung__c')),
-                    self.safe_value(r.get('Heizung_Sanitar__c')),
-                    self.safe_value(r.get('Elektro__c')),
-                    self.safe_value(r.get('Messdienstleister__c')),
-                    self.safe_value(r.get('Versicherungsmakler__c')),
-                    self.safe_value(r.get('Wasserschadenbehebung__c')),
-                    self.safe_value(r.get('Winterdienst__c')),
-                    self.safe_value(r.get('Schlusseldienst__c')),
-                    self.safe_value(r.get('Objekt_emailaddress__c')),
-                    self.safe_value(r.get('Owners_emails__c')),
-                    self.safe_value(r.get('Tenants_emails__c')),
-                    r.get('In_management_this_year__c', False),
-                    r.get('In_management_next_year__c', False),
-                    self.safe_value(r.get('Letzte_Abrechnung__c')),
-                    self.safe_value(r.get('Vertragsende_letzter_SEV_Vertrag__c')),
-                    self.safe_value(r.get('Verwaltervertragsende__c')),
-                    self.safe_value(r.get('Allgemeine_Hinweise__c')),
-                    self.safe_value(r.get('Status_Objektbuchhaltung__c')),
-                    r.get('Checked_and_confirmed__c', False),
-                    r.get('Check_today_with_last_SEV_date__c', False),
-                    r.get('Check_today_with_last_vertrage_date__c', False),
-                    self.safe_value(r.get('Picture__c')),
-                    self.safe_value(r.get('view_link__c')),
-                    self.safe_value(r.get('Impower__c')),
-                    self.safe_value(r.get('OwnerId')),
-                    self.safe_value(r.get('CreatedById')),
-                    self.safe_value(r.get('CreatedDate')),
-                    self.safe_value(r.get('LastModifiedById')),
-                    self.safe_value(r.get('LastModifiedDate')),
-                    self.safe_value(r.get('LastActivityDate')),
-                    self.safe_value(r.get('SystemModstamp')),
-                    r.get('IsDeleted', False)
-                ))
-
-            async with self.pool.acquire() as conn:
-                await conn.executemany(upsert_query, data)
-
-            await self.update_sync_metadata(object_name, datetime.now(), len(records))
-            logger.info(f"  ✓ Synced {len(records)} {object_name} records")
-            return len(records)
-
-        except Exception as e:
-            error_msg = f"Error syncing {object_name}: {str(e)}"
-            logger.error(f"  ✗ {error_msg}")
-            await self.update_sync_metadata(object_name, datetime.now(), 0, error_msg)
-            return 0
-
-    async def sync_units(self) -> int:
-        """Sync Hausunit__c objects"""
-        object_name = 'Hausunit__c'
-        logger.info(f"Syncing {object_name}...")
-
-        try:
-            last_sync = await self.get_last_sync_time(object_name)
-
-            query = f"""
-            SELECT Id, Name, Description__c, Objekt__c, Objekt_text__c,
-                   Type_of_unit__c, Bauart__c, Wohnflache__c, Heizflache__c,
-                   Count_active_SEV_contracts__c, Count_vertrage__c,
-                   Last_vertrag_start_date__c, Last_vertrage_end_date__c,
-                   Owner_note__c, AccountingID__c, Impower_Unit_ID__c, Trigger__c,
-                   CreatedById, CreatedDate, LastModifiedById, LastModifiedDate,
-                   LastActivityDate, SystemModstamp, IsDeleted
-            FROM Hausunit__c 
-            WHERE LastModifiedDate > {last_sync.isoformat()}
-            ORDER BY LastModifiedDate ASC
-            LIMIT 2000
-            """
-
-            results = self.sf.query_all(query)
-            records = results.get('records', [])
-
-            if not records:
-                logger.info(f"  No new changes for {object_name}")
-                return 0
-
-            logger.info(f"  Found {len(records)} modified records")
-
-            upsert_query = """
-                           INSERT INTO units (sf_id, name, description, objekt_id, objekt_text, type_of_unit, \
-                                              bauart, wohnflache, heizflache, count_active_sev_contracts, \
-                                              count_vertrage, last_vertrag_start_date, last_vertrage_end_date, \
-                                              owner_note, accounting_id, impower_unit_id, trigger_field, \
-                                              created_by_id, created_date, last_modified_by_id, last_modified_date, \
-                                              last_activity_date, system_modstamp, is_deleted) \
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                                   $16, $17, $18, $19, $20, $21, $22, $23, $24) ON CONFLICT (sf_id) DO \
-                           UPDATE SET
-                               name = EXCLUDED.name, \
-                               description = EXCLUDED.description, \
-                               type_of_unit = EXCLUDED.type_of_unit, \
-                               wohnflache = EXCLUDED.wohnflache, \
-                               last_modified_date = EXCLUDED.last_modified_date, \
-                               is_deleted = EXCLUDED.is_deleted, \
-                               synced_at = NOW() \
-                           """
-
-            data = []
-            for r in records:
-                data.append((
-                    r['Id'],
-                    self.safe_value(r.get('Name')),
-                    self.safe_value(r.get('Description__c')),
-                    self.safe_value(r.get('Objekt__c')),
-                    self.safe_value(r.get('Objekt_text__c')),
-                    self.safe_value(r.get('Type_of_unit__c')),
-                    self.safe_value(r.get('Bauart__c')),
-                    self.safe_value(r.get('Wohnflache__c')),
-                    self.safe_value(r.get('Heizflache__c')),
-                    self.safe_value(r.get('Count_active_SEV_contracts__c')),
-                    self.safe_value(r.get('Count_vertrage__c')),
-                    self.safe_value(r.get('Last_vertrag_start_date__c')),
-                    self.safe_value(r.get('Last_vertrage_end_date__c')),
-                    self.safe_value(r.get('Owner_note__c')),
-                    self.safe_value(r.get('AccountingID__c')),
-                    self.safe_value(r.get('Impower_Unit_ID__c')),
-                    self.safe_value(r.get('Trigger__c')),
-                    self.safe_value(r.get('CreatedById')),
-                    self.safe_value(r.get('CreatedDate')),
-                    self.safe_value(r.get('LastModifiedById')),
-                    self.safe_value(r.get('LastModifiedDate')),
-                    self.safe_value(r.get('LastActivityDate')),
-                    self.safe_value(r.get('SystemModstamp')),
-                    r.get('IsDeleted', False)
-                ))
-
-            async with self.pool.acquire() as conn:
-                await conn.executemany(upsert_query, data)
-
-            await self.update_sync_metadata(object_name, datetime.now(), len(records))
-            logger.info(f"  ✓ Synced {len(records)} {object_name} records")
-            return len(records)
-
-        except Exception as e:
-            error_msg = f"Error syncing {object_name}: {str(e)}"
-            logger.error(f"  ✗ {error_msg}")
-            await self.update_sync_metadata(object_name, datetime.now(), 0, error_msg)
-            return 0
-
-    async def sync_unit_owners(self) -> int:
-        """Sync Beziehung_zur_Einheit__c objects"""
-        object_name = 'Beziehung_zur_Einheit__c'
-        logger.info(f"Syncing {object_name}...")
-
-        try:
-            last_sync = await self.get_last_sync_time(object_name)
-
-            query = f"""
-            SELECT Id, Name, Owner__c, Unit__c, Parent_Objekt__c,
-                   Objekt_name__c, Haus_unit_description__c,
-                   Start_date__c, End_date__c, Active__c,
-                   OwnerId, CreatedById, CreatedDate, LastModifiedById,
-                   LastModifiedDate, LastActivityDate, SystemModstamp, IsDeleted
-            FROM Beziehung_zur_Einheit__c 
-            WHERE LastModifiedDate > {last_sync.isoformat()}
-            ORDER BY LastModifiedDate ASC
-            LIMIT 2000
-            """
-
-            results = self.sf.query_all(query)
-            records = results.get('records', [])
-
-            if not records:
-                logger.info(f"  No new changes for {object_name}")
-                return 0
-
-            logger.info(f"  Found {len(records)} modified records")
-
-            upsert_query = """
-                           INSERT INTO unit_owners (sf_id, name, owner_id, unit_id, parent_objekt_id, objekt_name, \
-                                                    haus_unit_description, start_date, end_date, active, sf_owner_id, \
-                                                    created_by_id, created_date, last_modified_by_id, \
-                                                    last_modified_date, \
-                                                    last_activity_date, system_modstamp, is_deleted) \
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                                   $16, $17, $18) ON CONFLICT (sf_id) DO \
-                           UPDATE SET
-                               owner_id = EXCLUDED.owner_id, \
-                               unit_id = EXCLUDED.unit_id, \
-                               start_date = EXCLUDED.start_date, \
-                               end_date = EXCLUDED.end_date, \
-                               active = EXCLUDED.active, \
-                               last_modified_date = EXCLUDED.last_modified_date, \
-                               is_deleted = EXCLUDED.is_deleted, \
-                               synced_at = NOW() \
-                           """
-
-            data = []
-            for r in records:
-                data.append((
-                    r['Id'],
-                    self.safe_value(r.get('Name')),
-                    self.safe_value(r.get('Owner__c')),
-                    self.safe_value(r.get('Unit__c')),
-                    self.safe_value(r.get('Parent_Objekt__c')),
-                    self.safe_value(r.get('Objekt_name__c')),
-                    self.safe_value(r.get('Haus_unit_description__c')),
-                    self.safe_value(r.get('Start_date__c')),
-                    self.safe_value(r.get('End_date__c')),
-                    r.get('Active__c', False),
-                    self.safe_value(r.get('OwnerId')),
-                    self.safe_value(r.get('CreatedById')),
-                    self.safe_value(r.get('CreatedDate')),
-                    self.safe_value(r.get('LastModifiedById')),
-                    self.safe_value(r.get('LastModifiedDate')),
-                    self.safe_value(r.get('LastActivityDate')),
-                    self.safe_value(r.get('SystemModstamp')),
-                    r.get('IsDeleted', False)
-                ))
-
-            async with self.pool.acquire() as conn:
-                await conn.executemany(upsert_query, data)
-
-            await self.update_sync_metadata(object_name, datetime.now(), len(records))
-            logger.info(f"  ✓ Synced {len(records)} {object_name} records")
-            return len(records)
-
-        except Exception as e:
-            error_msg = f"Error syncing {object_name}: {str(e)}"
-            logger.error(f"  ✗ {error_msg}")
-            await self.update_sync_metadata(object_name, datetime.now(), 0, error_msg)
-            return 0
-
-    async def sync_all(self):
-        """Sync all objects in correct order"""
-        logger.info("=" * 80)
-        logger.info(f"Starting incremental sync at {datetime.now()}")
-        logger.info("=" * 80)
-
-        start_time = datetime.now()
-
-        # Sync in order: clients -> properties -> units -> ownership
-        total_clients = await self.sync_clients()
-        total_properties = await self.sync_properties()
-        total_units = await self.sync_units()
-        total_owners = await self.sync_unit_owners()
-
-        elapsed = (datetime.now() - start_time).total_seconds()
-        total_records = total_clients + total_properties + total_units + total_owners
-
-        logger.info("=" * 80)
-        logger.info("Sync Summary:")
-        logger.info(f"  • Clients (Account): {total_clients}")
-        logger.info(f"  • Properties (Objekt__c): {total_properties}")
-        logger.info(f"  • Units (Hausunit__c): {total_units}")
-        logger.info(f"  • Ownership (Beziehung_zur_Einheit__c): {total_owners}")
-        logger.info(f"  • Total: {total_records} records")
-        logger.info(f"  • Duration: {elapsed:.2f}s")
-        logger.info("=" * 80)
-
-    async def run_continuous(self):
-        """Run sync continuously at specified interval"""
-        logger.info(f"Starting continuous sync (every {self.config.sync_interval_minutes} minutes)")
-
-        while True:
-            try:
-                await self.sync_all()
-                logger.info(f"Next sync in {self.config.sync_interval_minutes} minutes...")
-                await asyncio.sleep(self.config.sync_interval_minutes * 60)
-            except KeyboardInterrupt:
-                logger.info("Sync interrupted by user")
-                break
-            except Exception as e:
-                logger.error(f"Sync error: {e}", exc_info=True)
-                logger.info("Waiting 1 minute before retry...")
-                await asyncio.sleep(60)
-
-    async def close(self):
-        """Close connections"""
-        if self.pool:
-            await self.pool.close()
-            logger.info("Database connections closed")
-
-
-async def main():
-    """Main execution"""
-
-    config = SyncConfig(
-        # Salesforce credentials
-        sf_username=os.getenv('SF_USERNAME', 'your_username@example.com'),
-        sf_password=os.getenv('SF_PASSWORD', 'your_password'),
-        sf_security_token=os.getenv('SF_SECURITY_TOKEN', 'your_token'),
-
-        # PostgreSQL credentials
-        db_host=os.getenv('DB_HOST', 'localhost'),
-        db_port=int(os.getenv('DB_PORT', '5432')),
-        db_name=os.getenv('DB_NAME', 'property_management'),
-        db_user=os.getenv('DB_USER', 'postgres'),
-        db_password=os.getenv('DB_PASSWORD', 'your_password'),
-
-        # Sync interval in minutes
-        sync_interval_minutes=int(os.getenv('SYNC_INTERVAL', '5'))
-    )
-
-    syncer = SalesforceIncrementalSync(config)
-
-    try:
-        syncer.connect_salesforce()
-        await syncer.init_pool()
-
-        run_mode = os.getenv('RUN_MODE', 'continuous')
-
-        if run_mode == 'once':
-            await syncer.sync_all()
-        else:
-            await syncer.run_continuous()
-
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-    finally:
-        await syncer.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        finally:
+            self.db.close()

@@ -2,3 +2,6 @@ asyncpg
 psycopg
 python-dotenv
 simple-salesforce
+psycopg2-binary
+requests
+# crawl4ai

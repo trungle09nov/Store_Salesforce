@@ -52,3 +52,6 @@ log/*
 
 data
 data/*
+
+scripts
+scripts/*
